@@ -238,14 +238,31 @@ def _load_gguf_model(gguf_path, n_gpu_layers=-1, n_ctx=8192):
 # 4. 推理接口
 # ============================================================
 
-def run_inference(model_obj, processor, model_format, pil_image,
+def run_inference(model_obj, processor, model_format, pil_images,
                   system_prompt="", user_prompt="",
                   max_new_tokens=512, temperature=0.7):
+    """
+    执行多模态推理。
+    
+    Args:
+        pil_images: 单个 PIL.Image 或 PIL.Image 列表（多图/视频帧）
+    """
+    # 统一为列表处理
+    if isinstance(pil_images, (list, tuple)):
+        images_list = list(pil_images)
+    else:
+        images_list = [pil_images]
+
+    if not images_list:
+        return run_text_inference(model_obj, processor, model_format,
+                                  system_prompt, user_prompt,
+                                  max_new_tokens, temperature)
+
     if model_format == "HF":
-        return _infer_hf(model_obj, processor, pil_image,
+        return _infer_hf(model_obj, processor, images_list,
                          system_prompt, user_prompt, max_new_tokens, temperature)
     else:
-        return _infer_gguf(model_obj, pil_image,
+        return _infer_gguf(model_obj, images_list,
                            system_prompt, user_prompt, max_new_tokens, temperature)
 
 
@@ -266,14 +283,15 @@ def _build_instruction(system_prompt, user_prompt):
         parts.append(system_prompt)
     if user_prompt:
         parts.append(user_prompt)
-    return "\n".join(parts) if parts else "Describe this image in detail."
+    return "\n".join(parts) if parts else "描述这些图像/视频的内容。"
 
 
-def _infer_hf(model, processor, pil_image, system_prompt, user_prompt,
+def _infer_hf(model, processor, pil_images, system_prompt, user_prompt,
               max_new_tokens, temperature):
     instruction = _build_instruction(system_prompt, user_prompt)
-    user_text = f"<image>\n{instruction}"
-    inputs = processor(text=user_text, images=pil_image, return_tensors="pt")
+    # HuggingFace 多图输入：images 传列表，processor 自动处理
+    inputs = processor(text=instruction, images=pil_images,
+                       return_tensors="pt", padding=True)
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
     with torch.no_grad():
         outputs = model.generate(
@@ -281,7 +299,7 @@ def _infer_hf(model, processor, pil_image, system_prompt, user_prompt,
             temperature=temperature, top_p=0.9,
         )
     full_text = processor.decode(outputs[0], skip_special_tokens=True)
-    return full_text.strip()
+    return _clean_prompt_output(full_text)
 
 
 def _infer_hf_text(model, processor, system_prompt, user_prompt,
@@ -298,8 +316,12 @@ def _infer_hf_text(model, processor, system_prompt, user_prompt,
     return _clean_prompt_output(full_text)
 
 
-def _infer_gguf(llama, pil_image, system_prompt, user_prompt,
+def _infer_gguf(llama, pil_images, system_prompt, user_prompt,
                 max_new_tokens, temperature):
+    """
+    GGUF 推理：多图（多帧）通过多个 image_url 消息项传入，
+    让 Gemma4 自然理解为视频/图像序列。
+    """
     import base64
     from io import BytesIO
 
@@ -308,30 +330,43 @@ def _infer_gguf(llama, pil_image, system_prompt, user_prompt,
 
     if not is_mm:
         return (
-            "[Gemma4 提示] 当前 GGUF 模型缺少 mmproj 视觉投影，无法理解图片。\n\n"
+            "[Gemma4 提示] 当前 GGUF 模型缺少 mmproj 视觉投影，无法理解图片/视频。\n\n"
             "请将配套的 *mmproj*.gguf 与主模型放在同一目录，重启 ComfyUI。\n"
             "（如文件已在目录中，请关闭 ComfyUI 并重新启动以重新加载模型）"
         )
 
-    buffer = BytesIO()
-    pil_image.convert("RGB").save(buffer, format="JPEG", quality=92)
-    image_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-    data_uri = f"data:image/jpeg;base64,{image_b64}"
+    # 将多张图全部转 base64 JPEG
+    image_urls = []
+    for img in pil_images:
+        try:
+            buffer = BytesIO()
+            img.convert("RGB").save(buffer, format="JPEG", quality=90)
+            img_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+            data_uri = f"data:image/jpeg;base64,{img_b64}"
+            image_urls.append({"type": "image_url", "image_url": {"url": data_uri}})
+        except Exception as e:
+            print(f"[Gemma4GGUF] 图像编码失败: {e}")
+            continue
+
+    if not image_urls:
+        return run_text_inference(llama, None, "GGUF",
+                                  system_prompt, user_prompt,
+                                  max_new_tokens, temperature)
 
     instruction = _build_instruction(system_prompt, user_prompt)
+    # 消息格式：先放 image_urls（按时间顺序），后放 text
+    content = image_urls + [{"type": "text", "text": instruction}]
     messages = [{
         "role": "user",
-        "content": [
-            {"type": "image_url", "image_url": {"url": data_uri}},
-            {"type": "text", "text": instruction},
-        ],
+        "content": content,
     }]
 
     resp = llama.create_chat_completion(
         messages=messages, max_tokens=max_new_tokens,
         temperature=temperature, top_p=0.9,
     )
-    return resp["choices"][0]["message"]["content"].strip()
+    raw = resp["choices"][0]["message"]["content"].strip()
+    return _clean_prompt_output(raw)
 
 
 def _infer_gguf_text(llama, system_prompt, user_prompt,
@@ -375,12 +410,25 @@ def _model_choices():
     return (available,)
 
 
-def _image_to_pil(image_tensor):
+def _image_to_pil_list(image_tensor):
+    """把 ComfyUI IMAGE tensor 转换为 PIL.Image 列表（支持多图批量）。
+    IMAGE 格式: [B, H, W, 3]，B=batch_size=图的数量。
+    """
     if image_tensor.dim() == 4:
-        arr = (image_tensor[0].cpu().numpy() * 255).astype("uint8")
+        n = image_tensor.shape[0]
+        result = []
+        for i in range(n):
+            arr = (image_tensor[i].cpu().numpy() * 255).astype("uint8")
+            result.append(Image.fromarray(arr))
+        return result
     else:
         arr = (image_tensor.cpu().numpy() * 255).astype("uint8")
-    return Image.fromarray(arr)
+        return [Image.fromarray(arr)]
+
+
+def _image_to_pil(image_tensor):
+    """向后兼容：取第一张图。"""
+    return _image_to_pil_list(image_tensor)[0]
 
 
 def _has_valid_image(image):
@@ -391,6 +439,103 @@ def _has_valid_image(image):
     if image.numel() == 0:
         return False
     return True
+
+
+def _extract_video_frames(video, n_frames=8):
+    """
+    从 ComfyUI VIDEO 对象提取关键帧，返回 PIL.Image 列表。
+    
+    Args:
+        video: ComfyUI VIDEO 对象（含视频文件路径）
+        n_frames: 要提取的帧数（均匀采样）
+    
+    Returns:
+        list[PIL.Image]: 提取的帧图像列表
+        失败时返回空列表
+    """
+    if video is None:
+        return []
+
+    # 1. 获取视频文件路径
+    video_path = None
+    try:
+        if hasattr(video, "_VideoFromFile__file"):
+            video_path = getattr(video, "_VideoFromFile__file", None)
+        if not video_path and hasattr(video, "get_stream_source"):
+            try:
+                video_path = video.get_stream_source()
+            except Exception:
+                pass
+        if not video_path and hasattr(video, "info"):
+            info = getattr(video, "info", {})
+            if isinstance(info, dict):
+                video_path = info.get("file_path") or info.get("path") or info.get("video_path")
+        if not video_path:
+            for attr in ("path", "file_path", "filepath", "video_path", "_path"):
+                val = getattr(video, attr, None)
+                if val and isinstance(val, str) and os.path.isfile(val):
+                    video_path = val
+                    break
+    except Exception:
+        pass
+
+    if not video_path or not os.path.isfile(video_path):
+        print(f"[Gemma4Video] 无法获取视频文件路径，跳过视频输入")
+        return []
+
+    # 2. 使用 imageio 提取帧
+    try:
+        import imageio
+    except ImportError:
+        # 尝试使用 decord（如果可用）
+        try:
+            from decord import VideoReader, cpu
+            vr = VideoReader(video_path, ctx=cpu(0))
+            total = len(vr)
+            indices = [int(i * total / n_frames) for i in range(n_frames)]
+            indices = [min(max(idx, 0), total - 1) for idx in indices]
+            frames = vr.get_batch(indices).asnumpy()
+            return [Image.fromarray(frame) for frame in frames]
+        except Exception as e:
+            print(f"[Gemma4Video] 缺少 imageio 库，无法提取视频帧: {e}")
+            return []
+
+    try:
+        reader = imageio.get_reader(video_path, 'ffmpeg')
+        meta = reader.get_meta_data()
+        original_fps = meta.get('fps', 0)
+        duration = meta.get('duration', 0)
+
+        # 计算总帧数
+        try:
+            total_frames = reader.count_frames()
+        except Exception:
+            total_frames = int(duration * original_fps) if duration > 0 and original_fps > 0 else 0
+
+        if total_frames <= 0:
+            print(f"[Gemma4Video] 无法获取视频帧数信息")
+            reader.close()
+            return []
+
+        # 均匀采样 n_frames 帧
+        actual_n = min(n_frames, total_frames)
+        indices = [int(i * total_frames / actual_n) for i in range(actual_n)]
+
+        frames = []
+        for idx in indices:
+            try:
+                frame = reader.get_data(idx)
+                frames.append(Image.fromarray(frame))
+            except Exception as e:
+                print(f"[Gemma4Video] 读取帧 {idx} 失败: {e}")
+                continue
+
+        reader.close()
+        print(f"[Gemma4Video] 从视频提取 {len(frames)} 帧（共 {total_frames} 帧，fps={original_fps:.1f}, 时长={duration:.1f}s）")
+        return frames
+    except Exception as e:
+        print(f"[Gemma4Video] 视频帧提取失败: {e}")
+        return []
 
 
 # ============================================================
@@ -631,6 +776,8 @@ class Gemma4ImageCaption:
                     "placeholder": "User Prompt（可选，如要扩写的提示词）",
                 }),
                 "image": ("IMAGE",),
+                "video": ("VIDEO",),
+                "video_frames": ("INT", {"default": 8, "min": 1, "max": 32, "step": 1}),
                 "auto_unload": ("BOOLEAN", {"default": True}),
             },
         }
@@ -641,13 +788,15 @@ class Gemma4ImageCaption:
     FUNCTION = "process"
 
     def process(self, gemma4_model, system_preset, max_length, temperature,
-                system_prompt="", user_prompt="", image=None, auto_unload=True):
+                system_prompt="", user_prompt="", image=None, video=None,
+                video_frames=8, auto_unload=True):
         # 关键修复：确保模型可用（处理 None + mmproj 状态变更）
         ok, info = _ensure_model_ready(gemma4_model)
         if not ok:
             return (f"[错误] 模型无法使用: {info}",)
 
         has_image = _has_valid_image(image)
+        has_video = video is not None
 
         final_system = (
             system_prompt.strip()
@@ -656,19 +805,50 @@ class Gemma4ImageCaption:
         )
         final_user = user_prompt.strip() if user_prompt else ""
 
-        if has_image:
-            pil_image = _image_to_pil(image)
+        # 输入优先级: video > image > 纯文本
+        if has_video:
+            # 视频理解：提取多帧，作为图像序列推理
+            video_pil_frames = _extract_video_frames(video, n_frames=video_frames)
+            if video_pil_frames:
+                print(f"[Gemma4Process] 视频输入：{len(video_pil_frames)} 帧，开始推理")
+                result = run_inference(
+                    gemma4_model["model_obj"],
+                    gemma4_model["processor"],
+                    gemma4_model["model_format"],
+                    video_pil_frames,
+                    system_prompt=final_system,
+                    user_prompt=final_user,
+                    max_new_tokens=max_length,
+                    temperature=temperature,
+                )
+            else:
+                # 视频帧提取失败，降级为纯文本
+                print(f"[Gemma4Process] 视频帧提取失败，降级为纯文本推理")
+                result = run_text_inference(
+                    gemma4_model["model_obj"],
+                    gemma4_model["processor"],
+                    gemma4_model["model_format"],
+                    system_prompt=final_system,
+                    user_prompt=final_user,
+                    max_new_tokens=max_length,
+                    temperature=temperature,
+                )
+        elif has_image:
+            # 多图/单图：将 IMAGE tensor 转换为 PIL.Image 列表
+            pil_images = _image_to_pil_list(image)
+            print(f"[Gemma4Process] 图像输入：{len(pil_images)} 张，开始推理")
             result = run_inference(
                 gemma4_model["model_obj"],
                 gemma4_model["processor"],
                 gemma4_model["model_format"],
-                pil_image,
+                pil_images,
                 system_prompt=final_system,
                 user_prompt=final_user,
                 max_new_tokens=max_length,
                 temperature=temperature,
             )
         else:
+            # 纯文本：提示词扩写
             result = run_text_inference(
                 gemma4_model["model_obj"],
                 gemma4_model["processor"],
@@ -688,16 +868,19 @@ class Gemma4ImageCaption:
 # ---- 9c. 批量描述节点 ----
 
 class Gemma4BatchCaption:
+    """批量描述节点：每张图/每个视频帧独立推理，输出一行一个描述。"""
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "gemma4_model": ("GEMMA4_MODEL",),
-                "images": ("IMAGE",),
                 "system_preset": (_ALL_PRESET_NAMES, {"default": _ALL_PRESET_NAMES[0]}),
                 "max_length": ("INT", {"default": 256, "min": 64, "max": 2048, "step": 32}),
             },
             "optional": {
+                "images": ("IMAGE",),
+                "video": ("VIDEO",),
+                "video_frames": ("INT", {"default": 8, "min": 1, "max": 32, "step": 1}),
                 "system_prompt": ("STRING", {
                     "default": "", "multiline": True,
                     "placeholder": "自定义 System Prompt（留空则使用上方预设）",
@@ -715,7 +898,8 @@ class Gemma4BatchCaption:
     CATEGORY = "AI/Gemma4"
     FUNCTION = "batch_caption"
 
-    def batch_caption(self, gemma4_model, images, system_preset, max_length,
+    def batch_caption(self, gemma4_model, system_preset, max_length,
+                      images=None, video=None, video_frames=8,
                       system_prompt="", user_prompt="", auto_unload=True):
         # 关键修复：确保模型可用（处理 None + mmproj 状态变更）
         ok, info = _ensure_model_ready(gemma4_model)
@@ -729,10 +913,28 @@ class Gemma4BatchCaption:
         )
         final_user = user_prompt.strip() if user_prompt else ""
 
+        # 收集待处理的 PIL.Image 列表
+        pil_list = []
+
+        # 视频优先
+        if video is not None:
+            video_frames_list = _extract_video_frames(video, n_frames=video_frames)
+            if video_frames_list:
+                print(f"[Gemma4BatchCaption] 视频输入：提取 {len(video_frames_list)} 帧，逐帧描述")
+                pil_list.extend(video_frames_list)
+
+        # 然后是批量图像
+        if images is not None and _has_valid_image(images):
+            img_list = _image_to_pil_list(images)
+            print(f"[Gemma4BatchCaption] 图像输入：{len(img_list)} 张，逐张描述")
+            pil_list.extend(img_list)
+
+        if not pil_list:
+            return ("[Gemma4 提示] 没有可用的图像或视频输入。请连接 images 或 video 输入。",)
+
+        # 逐张/逐帧推理
         captions = []
-        for i in range(images.shape[0]):
-            arr = (images[i].cpu().numpy() * 255).astype("uint8")
-            pil_image = Image.fromarray(arr)
+        for idx, pil_image in enumerate(pil_list):
             caption = run_inference(
                 gemma4_model["model_obj"],
                 gemma4_model["processor"],
@@ -743,6 +945,7 @@ class Gemma4BatchCaption:
                 max_new_tokens=max_length, temperature=0.7,
             )
             captions.append(caption)
+            print(f"[Gemma4BatchCaption] 完成 {idx+1}/{len(pil_list)}")
 
         if auto_unload:
             _unload_gemma4_model(gemma4_model)
